@@ -1,0 +1,135 @@
+#!/bin/sh -e
+
+# == Defaults ==
+
+jenkins_hostname=localhost
+jenkins_ssh_port=7322
+jenkins_uri=http://localhost:8080/
+
+# == Parse Command-Line Arguments ==
+
+usage() {
+    cat <<EOT
+Usage: $0 OPTIONS FROM_NAME TO_NAME
+
+Read all Jenkins jobs in the view named FROM_NAME and create clones in a new view called TO_NAME.
+
+Options:
+  -h, --help                    Show this help and exit.
+  -H HOSTNAME, --host=HOSTNAME  Use this SSH hostname instead of localhost.
+  -j FILENAME, --jar=FILENAME   Use this Jenkins .jar file.
+  -p PORT, --port=PORT          Use this SSH port instead of the default 7322.
+  -u URI, --uri=URI             Use this Jenkins URI instead of the default http://localhost:8080/.
+
+Note that there are two ways for this script to talk to your Jenkins instance:
+
+  * If -j/--jar is given, HTTP will be used. This requires the jenkins-cli.jar file that can be downloaded from the "Manage Jenkins" part of your Jenkins instance.
+  * Otherwise, SSH will be used, in which case you will almost certainly need to give the script the -H/--host and/or -p/--port options to let it know how to make the connection.
+EOT
+}
+
+opts=$(getopt -n "$0" -l debug,help,host:,jar:port: -o dhH:j:p:u: -- "$@")
+eval set -- "$opts"
+while true; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -d|--debug)
+            debug=1; shift 1; continue
+            ;;
+        -H|--host)
+            jenkins_hostname=$2; shift 2; continue
+            ;;
+        -j|--jar)
+            jenkins_jar=$2; shift 2; continue
+            ;;
+        -p|--port)
+            jenkins_ssh_port=$2; shift 2; continue
+            ;;
+        -u|--uri)
+            jenkins_uri=$2; shift 2; continue
+            ;;
+        --)
+            shift
+            break  # No more options to parse.
+            ;;
+    esac
+done
+
+from_name=$1
+to_name=$2
+
+# == Workspace ==
+
+clean_up() {
+    echo "$0: cleaning up: $temp_dir"
+    rm -fr "$temp_dir/"
+}
+
+temp_dir=$(mktemp --directory)
+if [ -z "$debug" ]; then
+    trap clean_up 0 1 2 3 15
+fi
+
+# == Main Program ==
+
+if [ -z "$from_name" ]; then
+    echo >&2 "$0: error: no FROM_NAME given"
+    usage
+    exit 1
+fi
+if [ -z "$to_name" ]; then
+    echo >&2 "$0: error: no TO_NAME given"
+    usage
+    exit 1
+fi
+
+if [ -n "$jenkins_jar" ]; then
+    jenkins_command="java -jar $jenkins_jar -s $jenkins_uri"
+else
+    jenkins_command="ssh -p $jenkins_ssh_port $jenkins_hostname"
+fi
+echo "$0: Jenkins command: $jenkins_command"
+
+echo "$0: reading jobs in view: $from_name"
+job_list=$($jenkins_command list-jobs "$from_name")
+for job_name_old in $job_list; do
+    echo "$0: found job: $job_name_old"
+    job_name_new=$(echo "$job_name_old" | sed -e "s/^$from_name/$to_name/")
+    set +e
+    job_name_new_check=$($jenkins_command get-job "$job_name_new" 2>/dev/null)
+    set -e
+    if [ -n "$job_name_new_check" ]; then
+        echo >&2 "$0: error: job already exists: $job_name_new"
+        exit 2
+    fi
+    echo "$0: reading job configuration: $job_name_old"
+    $jenkins_command get-job "$job_name_old" > "$temp_dir/$job_name_old.xml"
+    sed -e "s/$from_name/$to_name/g" > "$temp_dir/$job_name_new.xml" < "$temp_dir/$job_name_old.xml"
+    echo "$0: creating job: $job_name_new"
+    set +e
+    $jenkins_command create-job "$job_name_new" < "$temp_dir/$job_name_new.xml"
+    status=$?
+    set -e
+    echo "$0: job created?"
+    if [ $status -ne 0 ]; then
+        echo >&2 "$0: error: create-job returned nonzero status: $status"
+        exit 2
+    fi
+done
+
+echo "$0: reading view configuration: $from_name"
+view_xml=$($jenkins_command get-view "$from_name" | sed -e "s/$from_name/$to_name/g")
+if [ -z "$view_xml" ]; then
+    echo >&2 "$0: error: couldn't read view configuration: $from_name"
+    exit 3
+fi
+echo "$0: creating view: $to_name"
+echo "$view_xml" | $jenkins_command create-view "$to_name"
+view_xml_check=$($jenkins_command get-view "$to_name")
+if [ -z "$view_xml_check" ]; then
+    echo >&2 "$0: error: empty view configuration: $to_name"
+    exit 3
+fi
